@@ -1,0 +1,23 @@
+[build]
+target = "xtensa-esp32-none-elf"
+
+[unstable]
+# The esp toolchain ships rust-src (not a prebuilt core), so build core/alloc
+# from source for the Xtensa target.
+build-std = ["core", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.xtensa-esp32-none-elf]
+# `espflash` flashes over the onboard USB-UART and opens a monitor.
+# `cargo run --release` -> build, flash, monitor.
+# `--ignore-app-descriptor`: esp-hal beta.0 images carry no ESP-IDF app descriptor,
+# which espflash v4 lints for. The image still boots fine. (Drop this flag if you
+# upgrade to esp-hal >= 1.0 stable + esp-bootloader-esp-idf.)
+runner = "espflash flash --monitor --ignore-app-descriptor"
+rustflags = [
+    "-C", "link-arg=-nostartfiles",
+    "-C", "link-arg=-Tlinkall.x",
+]
+
+[env]
+ESP_LOG = "info"

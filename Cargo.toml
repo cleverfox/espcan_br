@@ -1,0 +1,38 @@
+[package]
+name = "espcan_br"
+version = "0.1.0"
+edition = "2021"
+description = "SLCAN (LAWICEL) CAN<->USB-serial bridge for the WeAct CAN485 ESP32 dev board"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "espcan_br"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# Pinned to the esp-hal release whose TWAI/UART API this code was written against.
+# If you bump esp-hal, re-check uart::Config / twai::TwaiConfiguration signatures.
+esp-hal = { version = "=1.0.0-beta.0", features = ["esp32", "unstable"] }
+esp-backtrace = { version = "0.15.0", features = [
+    "esp32",
+    "panic-handler",
+    "exception-handler",
+    "println",
+] }
+# Only pulled in so panics can dump a backtrace; nothing is printed during normal
+# operation, so it does not corrupt the SLCAN stream on UART0.
+esp-println = { version = "0.13.0", features = ["esp32"] }
+
+embedded-can = "0.4"
+nb = "1.1"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = false
+
+[profile.dev]
+opt-level = "s"
