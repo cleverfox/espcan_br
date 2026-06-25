@@ -16,16 +16,26 @@
 #![no_std]
 #![no_main]
 
+mod led;
 mod slcan;
 
 use embedded_can::{ExtendedId, Frame, Id, StandardId};
 use esp_backtrace as _;
+use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
+use esp_hal::time::Rate;
 use esp_hal::twai::filter::SingleStandardFilter;
 use esp_hal::twai::{BaudRate, EspTwaiFrame, TimingConfig, Twai, TwaiConfiguration, TwaiMode};
 use esp_hal::uart::{Config as UartConfig, Uart};
 use esp_hal::Blocking;
 
+use led::ActivityLed;
 use slcan::{CanFrame, BELL, CR, MAX_FRAME_ASCII};
+
+/// Activity-LED refresh period. Also the width of one sliding-window bucket.
+const LED_TICK_MS: u64 = 100;
+/// Number of [`LED_TICK_MS`] buckets summed for the "frames in the last second"
+/// count. 10 * 100 ms = 1 s.
+const WINDOW_BUCKETS: usize = 10;
 
 /// Host serial speed of the USB-UART link. Must match the `-S` value given to
 /// `slcand`. 115200 is safe everywhere; raise it (e.g. 1_000_000) for more CAN
@@ -80,10 +90,14 @@ fn baud_from_s(digit: u8) -> Option<BaudRate> {
 /// NOTE: `esp_hal::time` is the most version-volatile API used here — if you bump
 /// esp-hal and this fails to compile, adjust just this function.
 fn now_ms() -> u16 {
-    let ms = esp_hal::time::Instant::now()
+    (now_millis() % 60_000) as u16
+}
+
+/// Free-running milliseconds since boot (no wrap, for LED tick timing).
+fn now_millis() -> u64 {
+    esp_hal::time::Instant::now()
         .duration_since_epoch()
-        .as_millis();
-    (ms % 60_000) as u16
+        .as_millis()
 }
 
 /// Convert a neutral [`CanFrame`] into an `EspTwaiFrame` for transmission.
@@ -149,6 +163,10 @@ struct Bridge {
     baud: BaudRate,
     timestamp: bool,
     can: Option<Twai<'static, Blocking>>,
+    /// Sliding-window frame counters (one bucket per [`LED_TICK_MS`]).
+    rx_buckets: [u32; WINDOW_BUCKETS],
+    tx_buckets: [u32; WINDOW_BUCKETS],
+    bucket_idx: usize,
 }
 
 impl Bridge {
@@ -159,7 +177,27 @@ impl Bridge {
             baud: DEFAULT_BAUD,
             timestamp: false,
             can: None,
+            rx_buckets: [0; WINDOW_BUCKETS],
+            tx_buckets: [0; WINDOW_BUCKETS],
+            bucket_idx: 0,
         }
+    }
+
+    /// Inbound (bus→host) frames seen in the last second.
+    fn rx_last_sec(&self) -> u32 {
+        self.rx_buckets.iter().sum()
+    }
+
+    /// Outbound (host→bus) frames sent in the last second.
+    fn tx_last_sec(&self) -> u32 {
+        self.tx_buckets.iter().sum()
+    }
+
+    /// Advance the sliding window by one bucket, clearing the slot we move into.
+    fn advance_bucket(&mut self) {
+        self.bucket_idx = (self.bucket_idx + 1) % WINDOW_BUCKETS;
+        self.rx_buckets[self.bucket_idx] = 0;
+        self.tx_buckets[self.bucket_idx] = 0;
     }
 
     /// Feed one received host byte; dispatch the command on CR.
@@ -247,6 +285,7 @@ impl Bridge {
     }
 
     fn handle_tx(&mut self, parsed: Option<CanFrame>, uart: &mut Uart<'static, Blocking>) {
+        let idx = self.bucket_idx;
         let Some(twai) = self.can.as_mut() else {
             reply(uart, &[BELL]); // channel not open
             return;
@@ -255,12 +294,16 @@ impl Bridge {
             .and_then(|f| to_esp(&f))
             .map(|frame| try_transmit(twai, &frame))
             .unwrap_or(false);
+        if ok {
+            self.tx_buckets[idx] += 1; // outbound activity (red)
+        }
         reply(uart, if ok { &[CR] } else { &[BELL] });
     }
 
     /// Drain pending received CAN frames to the host (bounded per call so the UART
     /// read side stays responsive).
     fn pump_can(&mut self, uart: &mut Uart<'static, Blocking>) {
+        let idx = self.bucket_idx;
         let Some(twai) = self.can.as_mut() else {
             return;
         };
@@ -268,6 +311,7 @@ impl Bridge {
         for _ in 0..16 {
             match twai.receive() {
                 Ok(frame) => {
+                    self.rx_buckets[idx] += 1; // inbound activity (green)
                     let f = from_esp(&frame);
                     let ts = if self.timestamp { Some(now_ms()) } else { None };
                     let n = slcan::format_frame(&f, ts, &mut out);
@@ -316,8 +360,22 @@ fn main() -> ! {
     .with_rx(peripherals.GPIO3)
     .with_tx(peripherals.GPIO1);
 
+    // WS2812B activity LED on GPIO4, driven over RMT channel 0
+    // (80 MHz source, clk_divider 1 -> 12.5 ns/tick).
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("RMT init");
+    let channel = rmt
+        .channel0
+        .configure(
+            peripherals.GPIO4,
+            TxChannelConfig::default().with_clk_divider(1),
+        )
+        .expect("RMT ch0");
+    let mut led = ActivityLed::new(channel);
+    led.set_rgb(0, 0, 0); // start dark
+
     let mut bridge = Bridge::new();
     let mut rxbuf = [0u8; 64];
+    let mut last_tick = now_millis();
 
     loop {
         // 1) Host -> command parser.
@@ -328,5 +386,15 @@ fn main() -> ! {
         }
         // 2) CAN bus -> host.
         bridge.pump_can(&mut uart);
+
+        // 3) Activity LED tick (~10 Hz): brightness tracks frames/sec.
+        let now = now_millis();
+        if now.wrapping_sub(last_tick) >= LED_TICK_MS {
+            last_tick = now;
+            let g = led::level_from_count(bridge.rx_last_sec()); // inbound  -> green
+            let r = led::level_from_count(bridge.tx_last_sec()); // outbound -> red
+            led.set_rgb(r, g, 0);
+            bridge.advance_bucket();
+        }
     }
 }

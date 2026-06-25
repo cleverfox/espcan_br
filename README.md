@@ -19,6 +19,7 @@ WeAct CAN485 DevBoard V1, classic ESP32 (Xtensa, dual-core). Relevant pins:
 | CAN TX          | GPIO27          | to onboard CAN transceiver             |
 | Host UART (TX)  | GPIO1           | UART0 → onboard USB-UART bridge        |
 | Host UART (RX)  | GPIO3           | UART0 → onboard USB-UART bridge        |
+| Activity LED    | GPIO4           | onboard WS2812B (1 LED, GRB), via RMT  |
 
 The classic ESP32 has **no native USB**, so the host link is UART0 routed through
 the board's onboard USB-UART chip — i.e. the same `/dev/ttyUSB*` you flash over.
@@ -74,6 +75,32 @@ cansend can0 123#DEADBEEF
 You can also talk to it directly in a terminal: open the port at 115200 8N1 and
 type SLCAN commands (each terminated by CR).
 
+## Test tool (`tools/slcan_tool.py`)
+
+A standalone Python tool (pyserial only — no SocketCAN/slcand needed) that opens
+the adapter's serial port, drives it to transmit generated frames at a chosen
+rate, and live-decodes inbound frames. Handy for bench/scope testing.
+
+```sh
+pip install pyserial        # once (or use your venv)
+
+# 500 kbit, send std id 0x123 = DEADBEEF at 50 frames/s, show inbound frames:
+python tools/slcan_tool.py -p /dev/cu.usbmodemXXXX -b 6 -i 123 -d DEADBEEF -r 50
+
+# incrementing 8-byte counter on an extended id at 200 fps:
+python tools/slcan_tool.py -p /dev/cu.usbmodemXXXX -i 18FF50E5 --ext \
+    --pattern inc --len 8 -r 200
+
+# receive only (just display bus frames):
+python tools/slcan_tool.py -p /dev/cu.usbmodemXXXX --listen
+```
+
+Key options: `-b` CAN bitrate code (0-8), `-i/--id/--address` (hex), `--ext`,
+`--rtr`, `--pattern fixed|inc|random`, `-d/--data` (hex), `--len`, `-r/--rate`
+(fps, 0 = max), `-c/--count`, `-v` (show acks/naks + TX echo). `python
+tools/slcan_tool.py -h` for all. It sends the same `C`/`S<d>`/`O` startup as
+slcand, so the adapter goes bus-on automatically.
+
 ## SLCAN protocol
 
 Commands are ASCII, terminated by `\r` (CR). Replies are `\r` for OK and
@@ -115,6 +142,23 @@ Received frames are pushed to the host in the same `t/T/r/R` format, with a
 
 `S0`/`S1` return BEL — 10/20 kbit need a baud prescaler larger than the classic
 ESP32's TWAI hardware supports. If unset, the bridge defaults to **S6 (500 kbit)**.
+
+## Activity LED
+
+The onboard WS2812B (GPIO4) shows live CAN activity:
+
+- **Green** brightness ∝ inbound frames/s (CAN bus → host).
+- **Red** brightness ∝ outbound frames/s (host → CAN bus).
+- Both directions at once → **yellow**.
+- Idle → off; brightness rises with the per-second frame rate and decays smoothly
+  (~1 s) as traffic stops.
+
+It's driven directly over esp-hal's RMT peripheral (no extra crate). The counting
+uses a 10×100 ms sliding window refreshed at 10 Hz. Tunables live in `src/led.rs`
+(`FRAMES_FOR_FULL`, `MAX_LEVEL`, `MIN_LEVEL`) and `src/main.rs` (`LED_TICK_MS`,
+`WINDOW_BUCKETS`). The pure `level_from_count()` mapping is hardware-agnostic and
+unit-testable; the WS2812 bit timing (`T0H/T0L/T1H/T1L` in `led.rs`) is
+scope-verifiable on GPIO4 if colours look off.
 
 ## Design notes
 
