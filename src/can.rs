@@ -255,6 +255,12 @@ fn from_esp(frame: &EspTwaiFrame) -> CanFrame {
 }
 
 /// Bounded busy-wait transmit so a dead/unacked bus can't hang the caller.
+///
+/// This runs while the shared `CAN` async mutex is held, so it must not stall the
+/// executor: a short retry budget covers transient FIFO-full backpressure and then
+/// gives up (the host gets a BELL), rather than spinning on a wedged bus.
+const TX_RETRIES: u32 = 50;
+
 fn try_transmit(twai: &mut Twai<'static, Blocking>, frame: &EspTwaiFrame) -> bool {
     let mut tries = 0u32;
     loop {
@@ -262,7 +268,7 @@ fn try_transmit(twai: &mut Twai<'static, Blocking>, frame: &EspTwaiFrame) -> boo
             Ok(_) => return true,
             Err(nb::Error::WouldBlock) => {
                 tries += 1;
-                if tries > 200_000 {
+                if tries > TX_RETRIES {
                     return false;
                 }
             }
