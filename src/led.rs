@@ -1,30 +1,23 @@
 //! WS2812B activity LED on GPIO4, driven directly via esp-hal's RMT peripheral.
 //!
-//! The board has a single WS2812B (GRB order). We use it as a bidirectional CAN
-//! activity indicator: green brightness tracks inbound (bus→host) frames-per-second
-//! and red tracks outbound (host→bus), so two-way traffic glows yellow.
-//!
-//! Driving the LED directly (instead of the `esp-hal-smartled` crate, which pins to
-//! exactly esp-hal 1.0.0 stable) keeps us on our pinned `=1.0.0-beta.0` with no
-//! extra dependency — RMT is part of esp-hal's `unstable` feature, already enabled.
+//! Green tracks inbound (bus->host) frames/s, red tracks outbound (host->bus), so
+//! two-way traffic glows yellow. Driving RMT directly avoids the `esp-hal-smartled`
+//! crate's strict esp-hal version pin.
 
 use esp_hal::gpio::Level;
-use esp_hal::rmt::{PulseCode, TxChannel};
+use esp_hal::rmt::{Channel, PulseCode, Tx};
+use esp_hal::Blocking;
 
 // --- Brightness mapping (tunable) -------------------------------------------
 
 /// Per-second frame count that maps to full (capped) brightness.
 pub const FRAMES_FOR_FULL: u32 = 50;
-/// Maximum per-channel level — capped well below 255 to stay eye-friendly and
-/// keep WS2812 current draw low.
+/// Maximum per-channel level — capped below 255 to stay eye-friendly / low-current.
 pub const MAX_LEVEL: u8 = 64;
 /// Floor applied when there is any activity, so a single frame is still visible.
 pub const MIN_LEVEL: u8 = 4;
 
 /// Map a frame count (over the last second) to a WS2812 channel level.
-///
-/// Pure and hardware-agnostic: `0 -> off`, otherwise a linear ramp from
-/// [`MIN_LEVEL`] up to [`MAX_LEVEL`] reached at [`FRAMES_FOR_FULL`] frames/s.
 pub fn level_from_count(count: u32) -> u8 {
     if count == 0 {
         return 0;
@@ -35,40 +28,34 @@ pub fn level_from_count(count: u32) -> u8 {
 }
 
 // --- WS2812B bit timing -----------------------------------------------------
-//
-// RMT source clock 80 MHz with clk_divider = 1 => 1 tick = 12.5 ns.
-// WS2812B bit period ~1.25 us; values below are within datasheet tolerance.
-// Scope-verify on GPIO4 and tweak if colours/brightness look off.
+// RMT source 80 MHz, clk_divider = 1 => 1 tick = 12.5 ns. Within datasheet
+// tolerance; scope-verify on GPIO4 and tweak if colours look off.
 
 const T0H: u16 = 32; // 0.40 us high for a '0' bit
 const T0L: u16 = 68; // 0.85 us low
 const T1H: u16 = 64; // 0.80 us high for a '1' bit
 const T1L: u16 = 36; // 0.45 us low
 
-/// 24 data bits + one terminator (line idles low -> WS2812 reset latch).
+/// 24 data bits + one end marker.
 const LEN: usize = 25;
 
 /// WS2812B activity LED bound to a configured RMT TX channel.
-///
-/// Generic over the channel type so we don't have to name the concrete
-/// `Channel<Blocking, N>` produced by `.configure()`.
-pub struct ActivityLed<C: TxChannel> {
-    ch: Option<C>,
+pub struct ActivityLed {
+    ch: Option<Channel<'static, Blocking, Tx>>,
 }
 
-impl<C: TxChannel> ActivityLed<C> {
-    pub fn new(ch: C) -> Self {
+impl ActivityLed {
+    pub fn new(ch: Channel<'static, Blocking, Tx>) -> Self {
         Self { ch: Some(ch) }
     }
 
-    /// Set the LED colour. Best-effort: a (very unlikely) RMT error drops the
-    /// channel and the LED simply stops updating rather than panicking.
+    /// Set the LED colour (best-effort; the channel is always retained).
     pub fn set_rgb(&mut self, r: u8, g: u8, b: u8) {
         let Some(ch) = self.ch.take() else {
             return;
         };
 
-        let mut data = [PulseCode::empty(); LEN];
+        let mut data = [PulseCode::end_marker(); LEN];
         let bytes = [g, r, b]; // WS2812B wants GRB order
         let mut i = 0;
         for byte in bytes {
@@ -81,10 +68,16 @@ impl<C: TxChannel> ActivityLed<C> {
                 i += 1;
             }
         }
-        // data[24] stays PulseCode::empty() — ends the transmission.
+        // data[24] stays end_marker() — terminates the transmission.
 
-        if let Ok(tx) = ch.transmit(&data) {
-            self.ch = tx.wait().ok();
-        }
+        // transmit() returns the channel back on error; wait() returns it back
+        // (Ok or Err) too — so `self.ch` is always restored.
+        self.ch = Some(match ch.transmit(&data) {
+            Ok(txn) => match txn.wait() {
+                Ok(c) => c,
+                Err((_, c)) => c,
+            },
+            Err((_, c)) => c,
+        });
     }
 }

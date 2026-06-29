@@ -1,13 +1,17 @@
 # espcan_br
 
-An **SLCAN / LAWICEL (CANUSB)** CAN ↔ serial bridge for the
-**WeAct CAN485 DevBoard V1 (classic ESP32)**, written in `no_std` Rust on
-[`esp-hal`](https://github.com/esp-rs/esp-hal).
+An **SLCAN / LAWICEL (CANUSB)** CAN bridge for the
+**WeAct CAN485 DevBoard V1 (classic ESP32)**, written in `no_std` async Rust on
+[`esp-hal`](https://github.com/esp-rs/esp-hal) + `esp-radio` (WiFi) + `embassy`.
 
-It turns the board into a standard serial-line CAN adapter: plug it into a host
-over USB and drive it with Linux `slcand`/`can-utils` (or any SLCAN-aware tool).
-This is a Rust port of the older STM32 `uart_can_br` firmware, keeping the same
-on-the-wire ASCII protocol so existing hosts work unchanged.
+It exposes the CAN bus as an SLCAN adapter over **two transports at once**: the
+**USB serial port (UART0)** and a **TCP server on port 2000** over WiFi. Each is an
+independent SLCAN port — drive either with Linux `slcand`/`can-utils` (or the
+included `tools/slcan_tool.py`). The on-the-wire ASCII protocol is unchanged from
+the original STM32 `uart_can_br`, so existing hosts work as-is.
+
+> The earlier simple, blocking, UART-only firmware (esp-hal `1.0.0-beta.0`) is
+> preserved under `legacy-beta0/`. Architecture/roadmap: see `PLAN.md`.
 
 ## Hardware
 
@@ -21,8 +25,67 @@ WeAct CAN485 DevBoard V1, classic ESP32 (Xtensa, dual-core). Relevant pins:
 | Host UART (RX)  | GPIO3           | UART0 → onboard USB-UART bridge        |
 | Activity LED    | GPIO4           | onboard WS2812B (1 LED, GRB), via RMT  |
 
-The classic ESP32 has **no native USB**, so the host link is UART0 routed through
-the board's onboard USB-UART chip — i.e. the same `/dev/ttyUSB*` you flash over.
+The classic ESP32 has **no native USB**, so the UART host link is UART0 routed
+through the board's onboard USB-UART chip — i.e. the same `/dev/ttyUSB*` you flash
+over. The console **logger is disabled** so it cannot corrupt the SLCAN byte stream
+on UART0.
+
+## WiFi & TCP
+
+The firmware speaks SLCAN over WiFi/TCP **on port 2000**, in addition to UART0.
+
+- **Modes.** With no saved credentials it boots into **config mode**: a WiFi AP
+  `espcan-br` (192.168.4.1, DHCP) serving an HTTP setup page. Enter your SSID +
+  password → it saves to flash and reboots into **STA mode** (joins your network).
+- **HTTP config** is reachable on both the AP IP and, in STA mode, the device's
+  station IP (shown on the page; a UART-speed setting is planned here).
+- **Multi-port semantics.** UART and each TCP connection are independent SLCAN
+  ports, each activated by its own `O`/`C` (a TCP disconnect implicitly closes its
+  port). The shared CAN controller is on-bus while *any* port is open, and every
+  received bus frame is **broadcast to all open ports**. `Sn` (bitrate) is only
+  honoured while the channel is fully closed.
+
+```sh
+# Point slcand at the TCP port (SLCAN over TCP):
+slcand -t <device-ip>:2000 can0   # or, on plain SLCAN-over-TCP hosts, nc <ip> 2000
+# Or the included tool over TCP — see tools/slcan_tool.py (UART today; TCP host = same protocol)
+```
+
+> Note: `make monitor` opens UART0, which now carries the **SLCAN byte stream**
+> (not logs). To debug WiFi bring-up, watch the LED / web page, or temporarily
+> re-enable a logger on a spare UART.
+
+### Auto-connect (outbound)
+
+For use behind NAT, the adapter can **dial out** to a server and bridge SLCAN over
+that connection instead of (or in addition to) waiting for inbound TCP. Set one URL
+on the web page; it reconnects automatically and shows a live status.
+
+URL format:
+
+```
+tcp://host:port/
+tls://host:port/?pubkey=<130-hex>&token=<hex>
+```
+
+- The server is the SLCAN peer — e.g. `slcand -p <port> slcan0` on a public host
+  (plaintext), or a TLS-terminating front (e.g. stunnel) for the TLS case. Server
+  must offer TLS 1.3 / `AES_128_GCM_SHA256` with an **ECDSA P-256** key.
+- **`pubkey`** (optional, `tls://` only): the server's uncompressed P-256 public
+  key (`04`+X+Y = 130 hex). When set, the handshake's `CertificateVerify` signature
+  must validate under this key, so the **server is authenticated by key pinning** —
+  no CA needed; a mismatched/MITM server is rejected (status shows the failure).
+  Without `pubkey`, TLS is **encrypt-only** (no server authentication).
+- **`token`** (optional): sent as the auth command `H<token>\r` immediately after
+  the link is up, to identify this adapter to the server.
+
+To get a server's `pubkey`: connect once **without** it (`tls://host:port/`); the
+web page shows **"Server key (last TLS connection)"** — copy that 130-hex value
+into `?pubkey=` to enable pinning.
+
+> TLS pinning needs a small fork of `embedded-tls` 0.18 (upstream doesn't export
+> the cert types its verifier trait names). It's pinned by `git`/`rev` in
+> `Cargo.toml` ([cleverfox/embedded-tls](https://github.com/cleverfox/embedded-tls)).
 
 > **Boot note (from the board docs):** holding the GPIO0 KEY while powering on
 > keeps the chip in download/boot mode; power-cycle again to run. Remove any TF
@@ -57,9 +120,13 @@ export PATH="$HOME/.rustup/toolchains/esp/bin:$PATH"
 cargo run --release
 ```
 
-Flashing uses `espflash flash --monitor --ignore-app-descriptor` (see
-`.cargo/config.toml`); the flag is only needed because esp-hal `1.0.0-beta.0`
-images don't embed an ESP-IDF app descriptor.
+**Dependencies.** The WiFi build pins the esp-hal stack (`esp-hal`, `esp-radio`,
+`esp-rtos`, …) to a fork of esp-hal `main`
+([cleverfox/esp-hal@espcan-br](https://github.com/cleverfox/esp-hal/tree/espcan-br))
+carrying two firmware-required patches (an esp-radio WiFi-timer deferred-arm fix
+and an Xtensa fn-ptr cast); see the `git`/`rev` entries in `Cargo.toml`. The image
+embeds an ESP-IDF app descriptor (`esp_app_desc!`), so `espflash` flashes it with
+no extra flags.
 
 ## Host usage (Linux SocketCAN)
 
@@ -101,6 +168,40 @@ Key options: `-b` CAN bitrate code (0-8), `-i/--id/--address` (hex), `--ext`,
 tools/slcan_tool.py -h` for all. It sends the same `C`/`S<d>`/`O` startup as
 slcand, so the adapter goes bus-on automatically.
 
+### Over the can_router TLS relay (`tools/slcan_router_tool.py`)
+
+Same tool, but it connects to a [can_router](../can_router/DESIGN.md) relay over
+**TLS** and authenticates with a token URL (stdlib `ssl` only). It **pins the
+server public key** (from the URL; mismatch aborts) and sends `H<token>\r`:
+
+```sh
+python tools/slcan_router_tool.py \
+  'tls://192.168.1.21:9996/?pubkey=04..&token=84..' -b 6 -i 123 -d DEADBEEF -r 50
+# receive only:
+python tools/slcan_router_tool.py 'tls://host:9996/?pubkey=04..&token=84..' --listen
+```
+
+Pinning is mandatory unless `--insecure` is passed. Once the relay pairs it with
+the bridge, it behaves exactly like `slcan_tool.py` (probes `V`, then `C/S/O`,
+then generates/displays frames).
+
+### TLS proxy for slcand (`tools/slcan_tls_proxy.py`)
+
+slcand has no TLS/pinning/token support, so this proxy bridges it to a can_router
+relay: it listens on a local TCP port and, per connection, opens a pinned TLS
+session to the relay, injects `H<token>\r`, then relays bytes verbatim.
+
+```sh
+python tools/slcan_tls_proxy.py \
+  'tls://192.168.1.21:9996/?pubkey=04..&token=84..' -l 127.0.0.1:2000 &
+slcand -o -s6 -t 127.0.0.1:2000 slcan0 && ifconfig slcan0 up   # FreeBSD
+```
+
+Pinning mandatory unless `--insecure`. It never parses SLCAN for the relay —
+slcand and the bridge speak end-to-end — but `-v` additionally **decodes and
+prints every relayed frame/line** (`TX` = host→bus, `RX` = bus→host; the auth
+token is redacted).
+
 ## SLCAN protocol
 
 Commands are ASCII, terminated by `\r` (CR). Replies are `\r` for OK and
@@ -112,16 +213,21 @@ Commands are ASCII, terminated by `\r` (CR). Replies are `\r` for OK and
 | `O`                    | Open channel (normal mode)                | CR           |
 | `L`                    | Open channel (listen-only)                | CR           |
 | `C`                    | Close channel                             | CR           |
-| `tIIILDD…`             | TX standard data frame (3-hex id)         | CR / BEL     |
-| `TIIIIIIIILDD…`        | TX extended data frame (8-hex id)         | CR / BEL     |
-| `rIIIL`                | TX standard remote frame                  | CR / BEL     |
-| `RIIIIIIIIL`           | TX extended remote frame                  | CR / BEL     |
+| `tIIILDD…`             | TX standard data frame (3-hex id)         | `z\r` / BEL  |
+| `TIIIIIIIILDD…`        | TX extended data frame (8-hex id)         | `Z\r` / BEL  |
+| `rIIIL`                | TX standard remote frame                  | `z\r` / BEL  |
+| `RIIIIIIIIL`           | TX extended remote frame                  | `Z\r` / BEL  |
 | `V`                    | Hardware/firmware version                 | `V1013\r`    |
 | `N`                    | Serial number                             | `N1234\r`    |
-| `F`                    | Status flags                              | `F00\r`      |
+| `F`                    | Status flags (real, see below)            | `Fxx\r`      |
 | `Z0` / `Z1`            | RX timestamps off / on                    | CR           |
 | `M` / `m`              | Acceptance code/mask (accepted, no-op)    | CR           |
+| `A`                    | Auto-retransmit (accepted, no-op)         | CR           |
 | `sXXYY`                | Custom BTR registers                      | BEL (unsupported) |
+
+Transmit success returns the Lawicel confirmation `z\r` (11-bit) / `Z\r` (29-bit);
+`F` returns a real 8-bit status byte from the TWAI error state — bit 2 = error
+warning, bit 5 = error passive, bit 7 = bus-off (0 when the channel is closed).
 
 Received frames are pushed to the host in the same `t/T/r/R` format, with a
 4-hex-digit millisecond timestamp appended (before the CR) when `Z1` is active.

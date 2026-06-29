@@ -1,8 +1,8 @@
 [package]
 name = "espcan_br"
-version = "0.1.0"
-edition = "2021"
-description = "SLCAN (LAWICEL) CAN<->USB-serial bridge for the WeAct CAN485 ESP32 dev board"
+version = "0.2.0"
+edition = "2024"
+description = "SLCAN CAN bridge over UART and WiFi/TCP for the WeAct CAN485 ESP32 board"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
@@ -12,27 +12,51 @@ test = false
 bench = false
 
 [dependencies]
-# Pinned to the esp-hal release whose TWAI/UART API this code was written against.
-# If you bump esp-hal, re-check uart::Config / twai::TwaiConfiguration signatures.
-esp-hal = { version = "=1.0.0-beta.0", features = ["esp32", "unstable"] }
-esp-backtrace = { version = "0.15.0", features = [
-    "esp32",
-    "panic-handler",
-    "exception-handler",
-    "println",
-] }
-# Only pulled in so panics can dump a backtrace; nothing is printed during normal
-# operation, so it does not corrupt the SLCAN stream on UART0.
-esp-println = { version = "0.13.0", features = ["esp32"] }
+# --- ESP / esp-hal stack (classic ESP32 / Xtensa) -------------------------
+# Pinned to a fork of esp-hal `main` carrying two firmware-required patches
+# (esp-radio WiFi-timer deferred-arm + an Xtensa fn-ptr cast). See that commit.
+esp-hal = { git = "https://github.com/cleverfox/esp-hal", rev = "085c248cd3deae99094084e8991be194b56367d4", features = ["esp32", "log-04", "unstable"] }
+esp-rtos = { git = "https://github.com/cleverfox/esp-hal", rev = "085c248cd3deae99094084e8991be194b56367d4", features = ["esp32", "esp-radio", "embassy", "log-04"] }
+esp-radio = { git = "https://github.com/cleverfox/esp-hal", rev = "085c248cd3deae99094084e8991be194b56367d4", features = ["esp32", "wifi", "log-04", "unstable"] }
+esp-alloc = { git = "https://github.com/cleverfox/esp-hal", rev = "085c248cd3deae99094084e8991be194b56367d4" }
+esp-backtrace = { git = "https://github.com/cleverfox/esp-hal", rev = "085c248cd3deae99094084e8991be194b56367d4", features = ["esp32", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { git = "https://github.com/cleverfox/esp-hal", rev = "085c248cd3deae99094084e8991be194b56367d4", features = ["esp32"] }
+esp-println = { git = "https://github.com/cleverfox/esp-hal", rev = "085c248cd3deae99094084e8991be194b56367d4", features = ["esp32", "log-04"] }
+esp-storage = { git = "https://github.com/cleverfox/esp-hal", rev = "085c248cd3deae99094084e8991be194b56367d4", features = ["esp32"] }
+embedded-storage = "0.3.1"
 
+# --- Embassy async runtime / networking -----------------------------------
+embassy-executor = "0.9.0"
+embassy-futures = "0.1"
+embassy-net = { version = "0.8.0", features = ["dhcpv4", "dns", "medium-ethernet", "multicast", "tcp", "udp"] }
+embassy-time = "0.5.0"
+embassy-sync = "0.7"
+embedded-io-async = "0.7"
+esp-hal-dhcp-server = "0.2"
+
+# Outbound TLS for auto-connect (TLS 1.3 client). Fork of embedded-tls 0.18 with a
+# visibility-only patch so we can implement a custom verifier (public-key pinning)
+# — upstream leaves CertificateRef / the cert entries unexported.
+embedded-tls = { git = "https://github.com/cleverfox/embedded-tls", rev = "80c53a552653dc8b416dd7bdd885561f230bfc78", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+# For the pinned-key verifier (match embedded-tls's versions).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "sha256"] }
+sha2 = { version = "0.10", default-features = false }
+
+# --- CAN / SLCAN ----------------------------------------------------------
 embedded-can = "0.4"
 nb = "1.1"
 
+# --- Utils ----------------------------------------------------------------
+static_cell = "2.1.0"
+heapless = "0.8"
+log = "0.4"
+
+[profile.dev]
+opt-level = 2
+
 [profile.release]
-opt-level = "s"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 debug = false
-
-[profile.dev]
-opt-level = "s"

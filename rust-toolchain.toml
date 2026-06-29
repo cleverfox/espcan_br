@@ -1,5 +1,5 @@
-# The classic ESP32 is an Xtensa core, so it needs the `esp` Rust toolchain
-# (a fork that ships an Xtensa backend + the xtensa-esp32-none-elf target).
-# Install with: cargo install espup && espup install
+# Classic ESP32 is Xtensa -> the `esp` Rust toolchain fork (espup install).
+# rust-src is needed for build-std (core+alloc) on xtensa-esp32-none-elf.
 [toolchain]
 channel = "esp"
+components = ["rust-src"]

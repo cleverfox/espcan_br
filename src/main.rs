@@ -1,400 +1,336 @@
-//! SLCAN (LAWICEL / CANUSB) bridge for the WeAct CAN485 ESP32 dev board.
+//! espcan_br — SLCAN CAN bridge over UART and WiFi/TCP, for the WeAct CAN485 ESP32.
 //!
-//! Exposes the classic ESP32's TWAI (CAN) controller as a serial-line CAN adapter
-//! over the onboard USB-UART (UART0), speaking the same ASCII protocol that Linux
-//! `slcand`/`can-utils` use. This is a Rust `no_std` port of the older STM32
-//! `uart_can_br` firmware.
+//! Transports: UART0 (the USB serial port) and TCP port 2000 on both the AP and STA
+//! WiFi stacks. Each is an independent SLCAN "port" (own `O`/`C` open state); the
+//! shared TWAI controller is on-bus while any port is open, and received bus frames
+//! are broadcast to every open port. See PLAN.md. Previous blocking firmware is in
+//! `legacy-beta0/`.
 //!
-//! Board pinout (WeAct CAN485DevBoardV1_ESP32):
-//!   * CAN RX  = GPIO26, CAN TX = GPIO27  (to the onboard CAN transceiver)
-//!   * UART0   = GPIO3 (RX) / GPIO1 (TX)  (to the onboard USB-UART bridge)
-//!
-//! Host usage (Linux):
-//!   slcand -o -s6 -t hw -S 115200 /dev/ttyUSB0 can0 && ip link set up can0
-//!   (-s6 = 500 kbit; see the bitrate table below.)
+//! Board pins: CAN RX=GPIO26 / TX=GPIO27, UART0 RX=GPIO3 / TX=GPIO1 (USB bridge),
+//! WS2812 activity LED=GPIO4. The console logger is intentionally disabled so it
+//! cannot corrupt the SLCAN stream on UART0.
 
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod autoconnect;
+mod can;
+mod config;
+mod http;
 mod led;
+mod mdns;
 mod slcan;
+mod transport;
+mod uart_poll;
 
-use embedded_can::{ExtendedId, Frame, Id, StandardId};
+use core::cell::Cell;
+use core::net::Ipv4Addr;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+
+use embassy_executor::Spawner;
+use embassy_net::tcp::TcpSocket;
+use embassy_net::{IpListenEndpoint, Ipv4Cidr, Runner, StackResources, StaticConfigV4};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::mutex::Mutex;
+use embassy_time::{Duration, Timer};
+use esp_alloc as _;
 use esp_backtrace as _;
+use esp_hal::clock::CpuClock;
+use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::ram;
 use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
+use esp_hal::rng::Rng;
 use esp_hal::time::Rate;
-use esp_hal::twai::filter::SingleStandardFilter;
-use esp_hal::twai::{BaudRate, EspTwaiFrame, TimingConfig, Twai, TwaiConfiguration, TwaiMode};
-use esp_hal::uart::{Config as UartConfig, Uart};
+use esp_hal::timer::timg::TimerGroup;
+use esp_hal::uart::{self, Uart, UartRx, UartTx};
 use esp_hal::Blocking;
+use esp_hal_dhcp_server::simple_leaser::SimpleDhcpLeaser;
+use esp_hal_dhcp_server::structs::DhcpServerConfig;
+use esp_radio::wifi::{
+    ap::AccessPointConfig, sta::StationConfig, ModeConfig, WifiController, WifiDevice, WifiEvent,
+};
+use esp_storage::FlashStorage;
 
+use config::{AutoConnectConfig, DeviceConfig, WifiConfig};
 use led::ActivityLed;
-use slcan::{CanFrame, BELL, CR, MAX_FRAME_ASCII};
 
-/// Activity-LED refresh period. Also the width of one sliding-window bucket.
+esp_bootloader_esp_idf::esp_app_desc!();
+
+const AP_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 4, 1);
+const DHCP_POOL_START: Ipv4Addr = Ipv4Addr::new(192, 168, 4, 10);
+const DHCP_POOL_END: Ipv4Addr = Ipv4Addr::new(192, 168, 4, 100);
+
+/// TCP port that speaks SLCAN.
+const SLCAN_TCP_PORT: u16 = 2000;
+
+/// LED activity window: 10 buckets x 100 ms = 1 s.
 const LED_TICK_MS: u64 = 100;
-/// Number of [`LED_TICK_MS`] buckets summed for the "frames in the last second"
-/// count. 10 * 100 ms = 1 s.
-const WINDOW_BUCKETS: usize = 10;
+const LED_BUCKETS: usize = 10;
+/// Blue status-LED level (~1/4 of full 255).
+const STATUS_BLUE: u8 = 64;
 
-/// Host serial speed of the USB-UART link. Must match the `-S` value given to
-/// `slcand`. 115200 is safe everywhere; raise it (e.g. 1_000_000) for more CAN
-/// throughput once you have confirmed the host keeps up.
-const SLCAN_UART_BAUD: u32 = 115_200;
+// Shared state (read by the HTTP server and tasks).
+pub(crate) static WIFI_CONFIG: Mutex<CriticalSectionRawMutex, WifiConfig> =
+    Mutex::new(WifiConfig::new());
+pub(crate) static DEVICE_CONFIG: Mutex<CriticalSectionRawMutex, DeviceConfig> =
+    Mutex::new(DeviceConfig::new());
+pub(crate) static AUTOCONNECT_CONFIG: Mutex<CriticalSectionRawMutex, AutoConnectConfig> =
+    Mutex::new(AutoConnectConfig::new());
+pub(crate) static STA_IP: Mutex<CriticalSectionRawMutex, Option<Ipv4Addr>> = Mutex::new(None);
+pub(crate) static WIFI_CONNECTED: AtomicBool = AtomicBool::new(false);
+pub(crate) static CONFIG_MODE: AtomicBool = AtomicBool::new(false);
+/// Number of currently-connected TCP SLCAN clients (across AP + STA).
+pub(crate) static TCP_CLIENTS: AtomicU32 = AtomicU32::new(0);
+/// Auto-connect status code (see `autoconnect::state`), shown on the web page.
+pub(crate) static AUTOCONNECT_STATE: AtomicU8 = AtomicU8::new(0);
+/// Public key (uncompressed P-256, 65 bytes) of the last TLS server we connected
+/// to — captured during the handshake and shown on the web page for pinning.
+pub(crate) static SERVER_PUBKEY: BlockingMutex<CriticalSectionRawMutex, Cell<Option<[u8; 65]>>> =
+    BlockingMutex::new(Cell::new(None));
 
-/// Default CAN bitrate used if the host opens the channel without sending `Sn`
-/// first. S6 = 500 kbit.
-const DEFAULT_BAUD: BaudRate = BaudRate::B500K;
-
-/// Map an SLCAN `Sn` digit to a TWAI [`BaudRate`].
-///
-/// The ESP32 TWAI clock is 80 MHz; custom entries are the ESP-IDF-proven timings.
-/// S0 (10 kbit) and S1 (20 kbit) need a prescaler beyond the classic ESP32's
-/// hardware range, so they are unsupported and return `None`.
-fn baud_from_s(digit: u8) -> Option<BaudRate> {
-    Some(match digit {
-        // S2 = 50 kbit:  80e6 / (80 * (1+15+4)) = 50000
-        b'2' => BaudRate::Custom(TimingConfig {
-            baud_rate_prescaler: 80,
-            sync_jump_width: 3,
-            tseg_1: 15,
-            tseg_2: 4,
-            triple_sample: false,
-        }),
-        // S3 = 100 kbit: 80e6 / (40 * 20) = 100000
-        b'3' => BaudRate::Custom(TimingConfig {
-            baud_rate_prescaler: 40,
-            sync_jump_width: 3,
-            tseg_1: 15,
-            tseg_2: 4,
-            triple_sample: false,
-        }),
-        b'4' => BaudRate::B125K,
-        b'5' => BaudRate::B250K,
-        b'6' => BaudRate::B500K,
-        // S7 = 800 kbit: 80e6 / (4 * (1+16+8)) = 800000
-        b'7' => BaudRate::Custom(TimingConfig {
-            baud_rate_prescaler: 4,
-            sync_jump_width: 3,
-            tseg_1: 16,
-            tseg_2: 8,
-            triple_sample: false,
-        }),
-        b'8' => BaudRate::B1000K,
-        _ => return None, // S0 (10k) / S1 (20k): not representable on classic ESP32
-    })
+macro_rules! mk_static {
+    ($t:ty, $val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
 }
 
-/// Current ms-resolution timestamp, wrapped to the Lawicel 0..=59999 range.
-///
-/// NOTE: `esp_hal::time` is the most version-volatile API used here — if you bump
-/// esp-hal and this fails to compile, adjust just this function.
-fn now_ms() -> u16 {
-    (now_millis() % 60_000) as u16
-}
+#[esp_rtos::main]
+async fn main(spawner: Spawner) -> ! {
+    let hw = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(hw);
 
-/// Free-running milliseconds since boot (no wrap, for LED tick timing).
-fn now_millis() -> u64 {
-    esp_hal::time::Instant::now()
-        .duration_since_epoch()
-        .as_millis()
-}
+    // Heap in bootloader-reclaimed DRAM2 (~98 KiB), separate from the stack.
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 96 * 1024);
 
-/// Convert a neutral [`CanFrame`] into an `EspTwaiFrame` for transmission.
-fn to_esp(f: &CanFrame) -> Option<EspTwaiFrame> {
-    let id: Id = if f.ext {
-        ExtendedId::new(f.id)?.into()
-    } else {
-        StandardId::new(f.id as u16)?.into()
-    };
-    if f.rtr {
-        EspTwaiFrame::new_remote(id, f.dlc as usize)
-    } else {
-        EspTwaiFrame::new(id, &f.data[..f.dlc as usize])
+    // ── Load WiFi + device config; decide mode ─────────────────────────
+    let mut flash = FlashStorage::new(peripherals.FLASH);
+    let saved = config::load(&mut flash);
+    let dev = config::load_device(&mut flash).unwrap_or_else(DeviceConfig::defaults);
+    let auto = config::load_autoconnect(&mut flash).unwrap_or_else(AutoConnectConfig::new);
+    drop(flash);
+    let config_mode = !saved.map(|c| c.is_valid()).unwrap_or(false);
+    CONFIG_MODE.store(config_mode, Ordering::Relaxed);
+    if let Some(c) = saved {
+        *WIFI_CONFIG.lock().await = c;
     }
-}
+    *DEVICE_CONFIG.lock().await = dev; // DeviceConfig is Copy; `dev` stays usable
+    *AUTOCONNECT_CONFIG.lock().await = auto;
 
-/// Convert a received `EspTwaiFrame` into a neutral [`CanFrame`].
-fn from_esp(frame: &EspTwaiFrame) -> CanFrame {
-    let mut f = CanFrame::default();
-    match frame.id() {
-        Id::Standard(s) => {
-            f.ext = false;
-            f.id = s.as_raw() as u32;
-        }
-        Id::Extended(e) => {
-            f.ext = true;
-            f.id = e.as_raw();
-        }
-    }
-    f.rtr = frame.is_remote_frame();
-    f.dlc = frame.dlc() as u8;
-    let d = frame.data();
-    f.data[..d.len()].copy_from_slice(d);
-    f
-}
+    // ── Start the RTOS / embassy runtime ───────────────────────────────
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-/// (Re)open the TWAI controller at `baud`.
-///
-/// We re-`steal()` the peripherals each time the channel is opened so the bitrate
-/// can change between `C`/`O` cycles. This is sound because the bridge is a single
-/// blocking superloop and the previous `Twai` is always dropped (releasing TWAI0
-/// and the pins) before this is called.
-fn open_twai(baud: BaudRate, listen_only: bool) -> Twai<'static, Blocking> {
-    let p = unsafe { esp_hal::peripherals::Peripherals::steal() };
-    let mode = if listen_only {
-        TwaiMode::ListenOnly
-    } else {
-        TwaiMode::Normal
-    };
-    // CAN RX = GPIO26, CAN TX = GPIO27 on this board.
-    let mut cfg = TwaiConfiguration::new(p.TWAI0, p.GPIO26, p.GPIO27, baud, mode);
-    // Accept everything (all bits don't-care) — filtering is the host's job.
-    cfg.set_filter(
-        const { SingleStandardFilter::new(b"xxxxxxxxxxx", b"x", [b"xxxxxxxx", b"xxxxxxxx"]) },
-    );
-    cfg.start()
-}
-
-/// The bridge state machine.
-struct Bridge {
-    line: [u8; 64],
-    len: usize,
-    baud: BaudRate,
-    timestamp: bool,
-    can: Option<Twai<'static, Blocking>>,
-    /// Sliding-window frame counters (one bucket per [`LED_TICK_MS`]).
-    rx_buckets: [u32; WINDOW_BUCKETS],
-    tx_buckets: [u32; WINDOW_BUCKETS],
-    bucket_idx: usize,
-}
-
-impl Bridge {
-    fn new() -> Self {
-        Self {
-            line: [0; 64],
-            len: 0,
-            baud: DEFAULT_BAUD,
-            timestamp: false,
-            can: None,
-            rx_buckets: [0; WINDOW_BUCKETS],
-            tx_buckets: [0; WINDOW_BUCKETS],
-            bucket_idx: 0,
-        }
-    }
-
-    /// Inbound (bus→host) frames seen in the last second.
-    fn rx_last_sec(&self) -> u32 {
-        self.rx_buckets.iter().sum()
-    }
-
-    /// Outbound (host→bus) frames sent in the last second.
-    fn tx_last_sec(&self) -> u32 {
-        self.tx_buckets.iter().sum()
-    }
-
-    /// Advance the sliding window by one bucket, clearing the slot we move into.
-    fn advance_bucket(&mut self) {
-        self.bucket_idx = (self.bucket_idx + 1) % WINDOW_BUCKETS;
-        self.rx_buckets[self.bucket_idx] = 0;
-        self.tx_buckets[self.bucket_idx] = 0;
-    }
-
-    /// Feed one received host byte; dispatch the command on CR.
-    fn feed_byte(&mut self, b: u8, uart: &mut Uart<'static, Blocking>) {
-        match b {
-            CR => {
-                if self.len > 0 {
-                    let len = self.len;
-                    self.len = 0;
-                    self.handle_line(len, uart);
-                } else {
-                    // Bare CR — Lawicel adapters answer with CR (keeps hosts happy).
-                    reply(uart, &[CR]);
-                }
-            }
-            b'\n' => { /* ignore LF */ }
-            _ => {
-                if self.len < self.line.len() {
-                    self.line[self.len] = b;
-                    self.len += 1;
-                } else {
-                    // Overflow — drop the partial line and signal an error.
-                    self.len = 0;
-                    reply(uart, &[BELL]);
-                }
-            }
-        }
-    }
-
-    fn handle_line(&mut self, len: usize, uart: &mut Uart<'static, Blocking>) {
-        let cmd = self.line[0];
-        let line = &self.line[..len];
-
-        match cmd {
-            b'V' => reply(uart, b"V1013\r"),
-            b'N' => reply(uart, b"N1234\r"),
-            b'F' => reply(uart, b"F00\r"), // status flags: nothing latched
-            b'M' | b'm' => reply(uart, &[CR]), // accept code/mask: we accept all, no-op
-            b'Z' => {
-                // Z0 / Z1 — timestamp off / on.
-                match line.get(1) {
-                    Some(b'0') => {
-                        self.timestamp = false;
-                        reply(uart, &[CR]);
-                    }
-                    Some(b'1') => {
-                        self.timestamp = true;
-                        reply(uart, &[CR]);
-                    }
-                    _ => reply(uart, &[BELL]),
-                }
-            }
-            b'S' => {
-                // Set bitrate — only valid while the channel is closed.
-                if self.can.is_some() {
-                    reply(uart, &[BELL]);
-                } else if let Some(b) = line.get(1).copied().and_then(baud_from_s) {
-                    self.baud = b;
-                    reply(uart, &[CR]);
-                } else {
-                    reply(uart, &[BELL]);
-                }
-            }
-            b's' => reply(uart, &[BELL]), // custom BTR registers: unsupported
-            b'O' | b'L' => {
-                // Open normal (O) or listen-only (L).
-                if self.can.is_none() {
-                    self.can = Some(open_twai(self.baud, cmd == b'L'));
-                }
-                reply(uart, &[CR]);
-            }
-            b'C' => {
-                // Close — drop the driver, which releases the bus.
-                self.can = None;
-                reply(uart, &[CR]);
-            }
-            b't' | b'T' | b'r' | b'R' => {
-                // Parse before the mutable call so `line` (a borrow of `self`) is
-                // released first. `CanFrame` is `Copy`, so this carries no borrow.
-                let parsed = slcan::parse_tx(line);
-                self.handle_tx(parsed, uart);
-            }
-            _ => reply(uart, &[BELL]),
-        }
-    }
-
-    fn handle_tx(&mut self, parsed: Option<CanFrame>, uart: &mut Uart<'static, Blocking>) {
-        let idx = self.bucket_idx;
-        let Some(twai) = self.can.as_mut() else {
-            reply(uart, &[BELL]); // channel not open
-            return;
-        };
-        let ok = parsed
-            .and_then(|f| to_esp(&f))
-            .map(|frame| try_transmit(twai, &frame))
-            .unwrap_or(false);
-        if ok {
-            self.tx_buckets[idx] += 1; // outbound activity (red)
-        }
-        reply(uart, if ok { &[CR] } else { &[BELL] });
-    }
-
-    /// Drain pending received CAN frames to the host (bounded per call so the UART
-    /// read side stays responsive).
-    fn pump_can(&mut self, uart: &mut Uart<'static, Blocking>) {
-        let idx = self.bucket_idx;
-        let Some(twai) = self.can.as_mut() else {
-            return;
-        };
-        let mut out = [0u8; MAX_FRAME_ASCII];
-        for _ in 0..16 {
-            match twai.receive() {
-                Ok(frame) => {
-                    self.rx_buckets[idx] += 1; // inbound activity (green)
-                    let f = from_esp(&frame);
-                    let ts = if self.timestamp { Some(now_ms()) } else { None };
-                    let n = slcan::format_frame(&f, ts, &mut out);
-                    reply(uart, &out[..n]);
-                }
-                Err(nb::Error::WouldBlock) => break,
-                Err(nb::Error::Other(_)) => break, // bus error; alerts are not surfaced
-            }
-        }
-    }
-}
-
-/// Attempt a transmit with a bounded busy-wait so a dead/unacked bus cannot hang
-/// the whole bridge.
-fn try_transmit(twai: &mut Twai<'static, Blocking>, frame: &EspTwaiFrame) -> bool {
-    let mut tries = 0u32;
-    loop {
-        match twai.transmit(frame) {
-            Ok(_) => return true,
-            Err(nb::Error::WouldBlock) => {
-                tries += 1;
-                if tries > 200_000 {
-                    return false;
-                }
-            }
-            Err(nb::Error::Other(_)) => return false,
-        }
-    }
-}
-
-/// Write bytes to the host, ignoring transient TX errors.
-fn reply(uart: &mut Uart<'static, Blocking>, bytes: &[u8]) {
-    let _ = uart.write(bytes);
-}
-
-#[esp_hal::main]
-fn main() -> ! {
-    let peripherals = esp_hal::init(esp_hal::Config::default());
-
-    // SLCAN host link over the onboard USB-UART bridge (UART0: GPIO3 RX / GPIO1 TX).
-    let mut uart = Uart::new(
+    // ── UART0 SLCAN link (USB bridge: GPIO3 RX / GPIO1 TX) ─────────────
+    // Blocking driver (polled): UART0 is the system console, and the async UART
+    // driver does not deliver RX on it under esp-rtos. See uart_poll.rs.
+    let uart = Uart::new(
         peripherals.UART0,
-        UartConfig::default().with_baudrate(SLCAN_UART_BAUD),
+        uart::Config::default().with_baudrate(dev.baud()),
     )
-    .expect("UART0 init")
+    .unwrap()
     .with_rx(peripherals.GPIO3)
     .with_tx(peripherals.GPIO1);
+    let (uart_rx, uart_tx) = uart.split();
 
-    // WS2812B activity LED on GPIO4, driven over RMT channel 0
-    // (80 MHz source, clk_divider 1 -> 12.5 ns/tick).
-    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("RMT init");
-    let channel = rmt
+    // ── WS2812 activity LED on GPIO4 via RMT ───────────────────────────
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).unwrap();
+    let led_channel = rmt
         .channel0
-        .configure(
-            peripherals.GPIO4,
-            TxChannelConfig::default().with_clk_divider(1),
-        )
-        .expect("RMT ch0");
-    let mut led = ActivityLed::new(channel);
-    led.set_rgb(0, 0, 0); // start dark
+        .configure_tx(&TxChannelConfig::default().with_clk_divider(1))
+        .unwrap()
+        .with_pin(peripherals.GPIO4);
+    let mut led = ActivityLed::new(led_channel);
+    led.set_rgb(0, 0, 0);
 
-    let mut bridge = Bridge::new();
-    let mut rxbuf = [0u8; 64];
-    let mut last_tick = now_millis();
+    // ── WiFi ───────────────────────────────────────────────────────────
+    let (mut controller, interfaces) =
+        esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();
+    let ap_device = interfaces.access_point;
+    let sta_device = interfaces.station;
 
+    let ap_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+        address: Ipv4Cidr::new(AP_IP, 24),
+        gateway: Some(AP_IP),
+        dns_servers: Default::default(),
+    });
+    let sta_config = embassy_net::Config::dhcpv4(Default::default());
+
+    let rng = Rng::new();
+    let net_seed = (rng.random() as u64) << 32 | rng.random() as u64;
+
+    let (ap_stack, ap_runner) = embassy_net::new(
+        ap_device,
+        ap_config,
+        mk_static!(StackResources<4>, StackResources::<4>::new()),
+        net_seed,
+    );
+    let (sta_stack, sta_runner) = embassy_net::new(
+        sta_device,
+        sta_config,
+        mk_static!(StackResources<6>, StackResources::<6>::new()),
+        net_seed,
+    );
+
+    if config_mode {
+        let ap = AccessPointConfig::default().with_ssid(dev.name_str().into());
+        controller.set_config(&ModeConfig::AccessPoint(ap)).unwrap();
+    } else {
+        let cfg = WIFI_CONFIG.lock().await;
+        let sta = StationConfig::default()
+            .with_ssid(cfg.ssid_str().into())
+            .with_password(cfg.password_str().into());
+        drop(cfg);
+        controller.set_config(&ModeConfig::Station(sta)).unwrap();
+    }
+    controller.start_async().await.unwrap();
+
+    // ── Tasks ──────────────────────────────────────────────────────────
+    spawner.spawn(can::can_rx_task()).ok();
+    spawner.spawn(uart_port(uart_rx, uart_tx)).ok();
+    spawner.spawn(tcp_port(ap_stack)).ok();
+    spawner.spawn(tcp_port(sta_stack)).ok();
+    spawner.spawn(net_task(ap_runner)).ok();
+    spawner.spawn(net_task(sta_runner)).ok();
+    spawner.spawn(sta_ip_monitor(sta_stack)).ok();
+    spawner.spawn(dhcp_server(ap_stack)).ok();
+    spawner.spawn(http::http_server(ap_stack, "AP")).ok();
+    spawner.spawn(http::http_server(sta_stack, "STA")).ok();
+    spawner.spawn(mdns::responder_task(sta_stack)).ok();
+    spawner.spawn(autoconnect::autoconnect_task(sta_stack)).ok();
+    if !config_mode {
+        spawner.spawn(connection_task(controller)).ok();
+    }
+
+    // ── Activity LED tick (sliding 1 s window over RX/TX counters) ──────
+    let mut rx_buckets = [0u32; LED_BUCKETS];
+    let mut tx_buckets = [0u32; LED_BUCKETS];
+    let mut idx = 0usize;
+    let mut last_rx = 0u32;
+    let mut last_tx = 0u32;
     loop {
-        // 1) Host -> command parser.
-        if let Ok(n) = uart.read(&mut rxbuf) {
-            for i in 0..n {
-                bridge.feed_byte(rxbuf[i], &mut uart);
-            }
-        }
-        // 2) CAN bus -> host.
-        bridge.pump_can(&mut uart);
+        Timer::after(Duration::from_millis(LED_TICK_MS)).await;
+        let rx = can::RX_COUNT.load(Ordering::Relaxed);
+        let tx = can::TX_COUNT.load(Ordering::Relaxed);
+        rx_buckets[idx] = rx.wrapping_sub(last_rx);
+        tx_buckets[idx] = tx.wrapping_sub(last_tx);
+        last_rx = rx;
+        last_tx = tx;
+        let g = led::level_from_count(rx_buckets.iter().sum());
+        let r = led::level_from_count(tx_buckets.iter().sum());
 
-        // 3) Activity LED tick (~10 Hz): brightness tracks frames/sec.
-        let now = now_millis();
-        if now.wrapping_sub(last_tick) >= LED_TICK_MS {
-            last_tick = now;
-            let g = led::level_from_count(bridge.rx_last_sec()); // inbound  -> green
-            let r = led::level_from_count(bridge.tx_last_sec()); // outbound -> red
-            led.set_rgb(r, g, 0);
-            bridge.advance_bucket();
+        // Blue = status, ~1 s cycle (idx 0..9). TCP client connected: mostly on
+        // (100 ms off / 900 ms on). Else WiFi ready: brief blink (900 ms off /
+        // 100 ms on). Else (connecting): off.
+        let tcp_connected = TCP_CLIENTS.load(Ordering::Relaxed) > 0;
+        let wifi_ready = CONFIG_MODE.load(Ordering::Relaxed) || WIFI_CONNECTED.load(Ordering::Relaxed);
+        let b = if tcp_connected {
+            if idx == 0 { 0 } else { STATUS_BLUE }
+        } else if wifi_ready {
+            if idx == 0 { STATUS_BLUE } else { 0 }
+        } else {
+            0
+        };
+
+        led.set_rgb(r, g, b);
+        idx = (idx + 1) % LED_BUCKETS;
+    }
+}
+
+#[embassy_executor::task]
+async fn uart_port(rx: UartRx<'static, Blocking>, tx: UartTx<'static, Blocking>) {
+    let mut sub = can::rx_subscriber();
+    let mut conn = uart_poll::PolledUart::new(rx, tx);
+    transport::run_port(&mut conn, &mut sub, transport::Iface::Serial).await;
+}
+
+#[embassy_executor::task(pool_size = 2)]
+async fn tcp_port(stack: embassy_net::Stack<'static>) {
+    let mut rx_buffer = [0u8; 1024];
+    let mut tx_buffer = [0u8; 1024];
+    loop {
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(Duration::from_secs(300)));
+        if socket
+            .accept(IpListenEndpoint {
+                addr: None,
+                port: SLCAN_TCP_PORT,
+            })
+            .await
+            .is_err()
+        {
+            Timer::after(Duration::from_millis(500)).await;
+            continue;
+        }
+        let mut sub = can::rx_subscriber();
+        TCP_CLIENTS.fetch_add(1, Ordering::Relaxed);
+        transport::run_port(&mut socket, &mut sub, transport::Iface::Tcp).await;
+        TCP_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+        socket.close();
+        Timer::after(Duration::from_millis(50)).await;
+        socket.abort();
+    }
+}
+
+#[embassy_executor::task]
+async fn connection_task(mut controller: WifiController<'static>) {
+    loop {
+        if matches!(controller.is_started(), Ok(true)) {
+            match controller.connect_async().await {
+                Ok(_) => {
+                    WIFI_CONNECTED.store(true, Ordering::Relaxed);
+                    controller
+                        .wait_for_event(WifiEvent::StationDisconnected)
+                        .await;
+                    WIFI_CONNECTED.store(false, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    Timer::after(Duration::from_millis(5000)).await;
+                }
+            }
+        } else {
+            return;
         }
     }
+}
+
+#[embassy_executor::task(pool_size = 2)]
+async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+    runner.run().await
+}
+
+#[embassy_executor::task]
+async fn sta_ip_monitor(stack: embassy_net::Stack<'static>) {
+    loop {
+        let current = stack.config_v4().map(|c| c.address.address());
+        {
+            let mut ip = STA_IP.lock().await;
+            *ip = current;
+        }
+        Timer::after(Duration::from_millis(1000)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn dhcp_server(stack: embassy_net::Stack<'static>) {
+    let config = DhcpServerConfig {
+        ip: AP_IP,
+        lease_time: Duration::from_secs(3600),
+        gateways: &[AP_IP],
+        subnet: None,
+        dns: &[AP_IP],
+        use_captive_portal: false,
+    };
+    let mut leaser = SimpleDhcpLeaser {
+        start: DHCP_POOL_START,
+        end: DHCP_POOL_END,
+        leases: Default::default(),
+    };
+    if let Err(_e) = esp_hal_dhcp_server::run_dhcp_server(stack, config, &mut leaser).await {}
 }

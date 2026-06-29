@@ -178,6 +178,9 @@ class Reader(threading.Thread):
             line = raw.decode("ascii", "replace")
         except Exception:
             return
+        if line in ("z", "Z"):
+            self.stats["ack"] += 1  # Lawicel transmit confirmation
+            return
         f = decode_frame(line)
         if f is not None:
             self.stats["rx"] += 1
@@ -228,6 +231,9 @@ def parse_args():
                    help="skip the C/S/O startup sequence")
     p.add_argument("--boot-delay", type=float, default=1.5,
                    help="seconds to wait after opening the port (ESP32 may reset)")
+    p.add_argument("--ready-timeout", type=float, default=15.0,
+                   help="max seconds to wait for the firmware to answer 'V' after "
+                        "the boot/reset before handshaking")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="also show acks/naks and non-frame lines, and echo TX")
     args = p.parse_args()
@@ -244,6 +250,32 @@ def send_line(ser, text, verbose=False):
     ser.write(text.encode("ascii") + CR)
     if verbose:
         print(f"  -> {text!r}")
+
+
+def wait_ready(ser, timeout, verbose=False):
+    """Probe with 'V' until the firmware answers 'V1013'.
+
+    Opening the USB port resets the ESP32 (DTR/RTS auto-reset); the WiFi firmware
+    then takes a while to boot. Rather than guess a delay, poll the version command
+    until the running app replies, so the handshake is never sent mid-boot. Must run
+    before the reader thread starts (it reads the port directly). Returns True if the
+    device answered.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ser.reset_input_buffer()
+        ser.write(b"V\r")
+        if verbose:
+            print("  -> 'V' (probe)")
+        end = time.monotonic() + 0.4
+        buf = b""
+        while time.monotonic() < end:
+            chunk = ser.read(64)
+            if chunk:
+                buf += chunk
+                if b"V1013" in buf:  # firmware version reply
+                    return True
+    return False
 
 
 def main():
@@ -272,6 +304,15 @@ def main():
     if args.boot_delay > 0:
         time.sleep(args.boot_delay)
     ser.reset_input_buffer()
+
+    # The port-open reset means the firmware may still be booting; wait until it
+    # actually answers before handshaking (unless told to skip the handshake).
+    if not args.no_open:
+        if wait_ready(ser, args.ready_timeout, args.verbose):
+            print("# device ready (V1013)")
+        else:
+            print(f"# WARNING: no response to 'V' within {args.ready_timeout}s "
+                  "— firmware not answering on this UART", file=sys.stderr)
 
     stats = {"tx": 0, "rx": 0, "ack": 0, "nak": 0}
     reader = Reader(ser, stats, args.verbose)
