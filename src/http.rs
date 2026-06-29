@@ -48,15 +48,30 @@ pub async fn http_server(stack: embassy_net::Stack<'static>, name: &'static str)
 async fn handle_request(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tcp::Error> {
     let mut buffer = [0u8; 1024];
     let mut pos = 0;
+    // Once headers are in, `need` = header_end + Content-Length (capped at the
+    // buffer). We keep reading until then, so a body that arrives in a later TCP
+    // segment than the headers is not truncated.
+    let mut need: Option<usize> = None;
 
     loop {
+        if need.map(|n| pos >= n).unwrap_or(false) || pos >= buffer.len() {
+            break;
+        }
         match socket.read(&mut buffer[pos..]).await {
-            Ok(0) => return Ok(()),
+            Ok(0) => {
+                if pos == 0 {
+                    return Ok(()); // client closed without sending anything
+                }
+                break; // EOF: process whatever we got
+            }
             Ok(len) => {
                 pos += len;
-                let req = unsafe { core::str::from_utf8_unchecked(&buffer[..pos]) };
-                if req.contains("\r\n\r\n") || pos >= buffer.len() {
-                    break;
+                if need.is_none() {
+                    if let Some(i) = find_subslice(&buffer[..pos], b"\r\n\r\n") {
+                        let header_end = i + 4;
+                        let clen = content_length(&buffer[..header_end]).unwrap_or(0);
+                        need = Some(header_end.saturating_add(clen).min(buffer.len()));
+                    }
                 }
             }
             Err(e) => return Err(e),
@@ -93,6 +108,23 @@ fn parse_request_line(request: &str) -> (&str, &str) {
     let line = request.lines().next().unwrap_or("");
     let mut parts = line.split_whitespace();
     (parts.next().unwrap_or(""), parts.next().unwrap_or("/"))
+}
+
+/// Byte-offset of the first occurrence of `needle` in `hay`.
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Parse the `Content-Length` header (case-insensitive) from the header bytes.
+fn content_length(headers: &[u8]) -> Option<usize> {
+    let s = core::str::from_utf8(headers).ok()?;
+    s.split("\r\n").find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| v.trim().parse().ok())
+            .flatten()
+    })
 }
 
 /// Polls `/api/status` and updates only the live fields, so editing a form on the
