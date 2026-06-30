@@ -39,6 +39,7 @@ use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use esp_hal::gpio::{Input, InputConfig, Pull};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::ram;
 use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
@@ -54,7 +55,7 @@ use esp_radio::wifi::{
 };
 use esp_storage::FlashStorage;
 
-use config::{AutoConnectConfig, DeviceConfig, WifiConfig};
+use config::{AuthConfig, AutoConnectConfig, DeviceConfig, WifiConfig};
 use led::ActivityLed;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -70,7 +71,7 @@ const SLCAN_TCP_PORT: u16 = 2000;
 const LED_TICK_MS: u64 = 100;
 const LED_BUCKETS: usize = 10;
 /// Blue status-LED level (~1/4 of full 255).
-const STATUS_BLUE: u8 = 64;
+const STATUS_BLUE: u8 = 10;
 
 // Shared state (read by the HTTP server and tasks).
 pub(crate) static WIFI_CONFIG: Mutex<CriticalSectionRawMutex, WifiConfig> =
@@ -79,6 +80,13 @@ pub(crate) static DEVICE_CONFIG: Mutex<CriticalSectionRawMutex, DeviceConfig> =
     Mutex::new(DeviceConfig::new());
 pub(crate) static AUTOCONNECT_CONFIG: Mutex<CriticalSectionRawMutex, AutoConnectConfig> =
     Mutex::new(AutoConnectConfig::new());
+/// Web-interface login credentials (HTTP Basic Auth). Empty = open.
+pub(crate) static AUTH_CONFIG: Mutex<CriticalSectionRawMutex, AuthConfig> =
+    Mutex::new(AuthConfig::new());
+/// `true` while the GPIO0 (BOOT) button is held — the physical owner override
+/// that bypasses web-interface authentication (so a forgotten password can be
+/// reset). Sampled by `gpio0_monitor`, never as a boot strap.
+pub(crate) static GPIO0_HELD: AtomicBool = AtomicBool::new(false);
 pub(crate) static STA_IP: Mutex<CriticalSectionRawMutex, Option<Ipv4Addr>> = Mutex::new(None);
 pub(crate) static WIFI_CONNECTED: AtomicBool = AtomicBool::new(false);
 pub(crate) static CONFIG_MODE: AtomicBool = AtomicBool::new(false);
@@ -113,6 +121,7 @@ async fn main(spawner: Spawner) -> ! {
     let saved = config::load(&mut flash);
     let dev = config::load_device(&mut flash).unwrap_or_else(DeviceConfig::defaults);
     let auto = config::load_autoconnect(&mut flash).unwrap_or_else(AutoConnectConfig::new);
+    let authcfg = config::load_auth(&mut flash).unwrap_or_else(AuthConfig::new);
     drop(flash);
     let config_mode = !saved.map(|c| c.is_valid()).unwrap_or(false);
     CONFIG_MODE.store(config_mode, Ordering::Relaxed);
@@ -121,6 +130,7 @@ async fn main(spawner: Spawner) -> ! {
     }
     *DEVICE_CONFIG.lock().await = dev; // DeviceConfig is Copy; `dev` stays usable
     *AUTOCONNECT_CONFIG.lock().await = auto;
+    *AUTH_CONFIG.lock().await = authcfg;
 
     // ── Start the RTOS / embassy runtime ───────────────────────────────
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -148,6 +158,14 @@ async fn main(spawner: Spawner) -> ! {
         .with_pin(peripherals.GPIO4);
     let mut led = ActivityLed::new(led_channel);
     led.set_rgb(0, 0, 0);
+
+    // ── GPIO0 (BOOT button) — physical auth-bypass override ────────────
+    // Sampled only at runtime (never as a boot strap). Active-low: the button
+    // pulls the pin to GND, so "held" == low.
+    let gpio0 = Input::new(
+        peripherals.GPIO0,
+        InputConfig::default().with_pull(Pull::Up),
+    );
 
     // ── WiFi ───────────────────────────────────────────────────────────
     let (mut controller, interfaces) =
@@ -192,6 +210,7 @@ async fn main(spawner: Spawner) -> ! {
     controller.start_async().await.unwrap();
 
     // ── Tasks ──────────────────────────────────────────────────────────
+    spawner.spawn(gpio0_monitor(gpio0)).ok();
     spawner.spawn(can::can_rx_task()).ok();
     spawner.spawn(uart_port(uart_rx, uart_tx)).ok();
     spawner.spawn(tcp_port(ap_stack)).ok();
@@ -275,6 +294,16 @@ async fn tcp_port(stack: embassy_net::Stack<'static>) {
         socket.close();
         Timer::after(Duration::from_millis(50)).await;
         socket.abort();
+    }
+}
+
+/// Polls the GPIO0 (BOOT) button and publishes its held state. Holding it
+/// bypasses web-interface auth so a forgotten password can be reset.
+#[embassy_executor::task]
+async fn gpio0_monitor(pin: Input<'static>) {
+    loop {
+        GPIO0_HELD.store(pin.is_low(), Ordering::Relaxed);
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
 

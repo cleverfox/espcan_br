@@ -13,9 +13,10 @@ use embassy_net::IpListenEndpoint;
 use embassy_time::{Duration, Timer};
 use esp_storage::FlashStorage;
 
-use crate::config::{self, AutoConnectConfig, DeviceConfig, WifiConfig};
+use crate::config::{self, AuthConfig, AutoConnectConfig, DeviceConfig, WifiConfig};
 use crate::{
-    can, AUTOCONNECT_CONFIG, CONFIG_MODE, DEVICE_CONFIG, STA_IP, WIFI_CONFIG, WIFI_CONNECTED,
+    can, AUTH_CONFIG, AUTOCONNECT_CONFIG, CONFIG_MODE, DEVICE_CONFIG, GPIO0_HELD, STA_IP,
+    WIFI_CONFIG, WIFI_CONNECTED,
 };
 
 const HTTP_PORT: u16 = 80;
@@ -81,22 +82,33 @@ async fn handle_request(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::t
     let request = unsafe { core::str::from_utf8_unchecked(&buffer[..pos]) };
     let (method, path) = parse_request_line(request);
 
-    let response = match (method, path) {
-        ("GET", "/") => index_page().await,
-        ("GET", "/api/status") => status_json().await,
-        ("POST", "/api/wifi") => {
-            let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
-            save_wifi(body).await
+    // Authentication gate: every endpoint requires HTTP Basic Auth once a
+    // password is configured. Holding GPIO0 (the BOOT button) is the physical
+    // owner override that bypasses it — used to reset a forgotten password.
+    let response = if !authorized(request).await {
+        unauthorized()
+    } else {
+        match (method, path) {
+            ("GET", "/") => index_page().await,
+            ("GET", "/api/status") => status_json().await,
+            ("POST", "/api/wifi") => {
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                save_wifi(body).await
+            }
+            ("POST", "/api/device") => {
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                save_device(body).await
+            }
+            ("POST", "/api/autoconnect") => {
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                save_autoconnect(body).await
+            }
+            ("POST", "/api/auth") => {
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                save_auth(body).await
+            }
+            _ => String::from("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
         }
-        ("POST", "/api/device") => {
-            let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
-            save_device(body).await
-        }
-        ("POST", "/api/autoconnect") => {
-            let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
-            save_autoconnect(body).await
-        }
-        _ => String::from("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
     };
 
     socket.write_all(response.as_bytes()).await?;
@@ -108,6 +120,99 @@ fn parse_request_line(request: &str) -> (&str, &str) {
     let line = request.lines().next().unwrap_or("");
     let mut parts = line.split_whitespace();
     (parts.next().unwrap_or(""), parts.next().unwrap_or("/"))
+}
+
+/// Decide whether a request may proceed. Allowed when: GPIO0 is held (physical
+/// owner override), or no credentials are configured (open), or the request
+/// carries valid HTTP Basic Auth credentials.
+async fn authorized(request: &str) -> bool {
+    if GPIO0_HELD.load(Ordering::Relaxed) {
+        return true;
+    }
+    let cfg = AUTH_CONFIG.lock().await;
+    if !cfg.is_set() {
+        return true;
+    }
+    let Some(token) = basic_auth_token(request) else {
+        return false;
+    };
+    let mut decoded = [0u8; 128];
+    let Some(n) = base64_decode(token, &mut decoded) else {
+        return false;
+    };
+    let Ok(creds) = core::str::from_utf8(&decoded[..n]) else {
+        return false;
+    };
+    let Some((user, pass)) = creds.split_once(':') else {
+        return false;
+    };
+    cfg.verify(user, pass)
+}
+
+/// Extract the base64 blob from an `Authorization: Basic <blob>` header.
+fn basic_auth_token(request: &str) -> Option<&str> {
+    request
+        .lines()
+        .take_while(|l| !l.is_empty())
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("authorization") {
+                let v = v.trim();
+                v.strip_prefix("Basic ").or_else(|| v.strip_prefix("basic "))
+            } else {
+                None
+            }
+        })
+}
+
+/// Decode standard base64 (with optional `=` padding) into `dst`; returns the
+/// number of bytes written, or `None` on an invalid character / overflow.
+fn base64_decode(src: &str, dst: &mut [u8]) -> Option<usize> {
+    let mut acc: u32 = 0;
+    let mut bits: u8 = 0;
+    let mut di = 0usize;
+    for &c in src.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = base64_value(c)?;
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            if di >= dst.len() {
+                return None;
+            }
+            dst[di] = (acc >> bits) as u8;
+            di += 1;
+        }
+    }
+    Some(di)
+}
+
+fn base64_value(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// 401 response prompting the browser for HTTP Basic Auth credentials.
+fn unauthorized() -> String {
+    let body = "Authentication required.\n";
+    let mut resp = String::new();
+    let _ = write!(
+        resp,
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"espcan_br\"\r\n\
+         Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+    resp
 }
 
 /// Byte-offset of the first occurrence of `needle` in `hay`.
@@ -337,6 +442,31 @@ async fn index_page() -> String {
         dev_name, dev_name, dev_baud,
         ac_status, server_key_hex, ac_en_chk, ac_url,
     );
+
+    // Web-interface login (HTTP Basic Auth).
+    let (auth_set, auth_user) = {
+        let a = AUTH_CONFIG.lock().await;
+        (a.is_set(), html_escape(a.user_str()))
+    };
+    let auth_state = if auth_set {
+        "enabled"
+    } else {
+        "disabled (anyone on the network can read this page)"
+    };
+    let _ = write!(
+        body,
+        "<h3>Web login</h3>\
+         <p>Status: <b>{}</b></p>\
+         <form method=POST action=/api/auth>\
+         Login:<br><input name=user maxlength=31 value=\"{}\" style=width:100%><br>\
+         Password:<br><input name=pass type=password maxlength=63 style=width:100%><br>\
+         <small style=color:#888>Leave both blank to disable login. \
+         Forgot the password? Hold the BOOT (GPIO0) button while opening this page \
+         to bypass login and reset it.</small><br><br>\
+         <button type=submit>Save login</button></form>",
+        auth_state, auth_user,
+    );
+
     // Live fields refresh via JS (so editing a form is not interrupted by a reload).
     body.push_str(STATUS_SCRIPT);
 
@@ -477,6 +607,62 @@ async fn save_autoconnect(body: &str) -> String {
     String::from(
         "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 12\r\n\r\nsave failed\n",
     )
+}
+
+async fn save_auth(body: &str) -> String {
+    let mut user_buf = [0u8; 32];
+    let mut pass_buf = [0u8; 64];
+    let user_len = find_form_value(body, "user")
+        .map(|v| url_decode_into(v, &mut user_buf))
+        .unwrap_or(0);
+    let pass_len = find_form_value(body, "pass")
+        .map(|v| url_decode_into(v, &mut pass_buf))
+        .unwrap_or(0);
+    let user = unsafe { core::str::from_utf8_unchecked(&user_buf[..user_len]) };
+    let pass = unsafe { core::str::from_utf8_unchecked(&pass_buf[..pass_len]) };
+
+    // A ':' in the username can never be sent back via Basic Auth (the browser
+    // splits on the first ':'), so reject it rather than store something
+    // unusable.
+    if user.contains(':') {
+        let msg = "username may not contain ':'\n";
+        let mut resp = String::new();
+        let _ = write!(
+            resp,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            msg.len(),
+            msg,
+        );
+        return resp;
+    }
+
+    let mut cfg = AuthConfig::new();
+    cfg.set(user, pass);
+
+    let mut flash = FlashStorage::new(unsafe { esp_hal::peripherals::FLASH::steal() });
+    let saved = config::save_auth(&mut flash, &cfg).is_ok();
+    {
+        *AUTH_CONFIG.lock().await = cfg;
+    }
+
+    if saved {
+        let disabled = user.is_empty() || pass.is_empty();
+        log::info!("web login updated: enabled={}", !disabled);
+        let msg = if disabled {
+            "Web login disabled.\n"
+        } else {
+            "Web login updated.\n"
+        };
+        let mut resp = String::new();
+        let _ = write!(
+            resp,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            msg.len(),
+            msg,
+        );
+        return resp;
+    }
+    String::from("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 12\r\n\r\nsave failed\n")
 }
 
 fn find_form_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {

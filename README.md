@@ -87,6 +87,32 @@ into `?pubkey=` to enable pinning.
 > the cert types its verifier trait names). It's pinned by `git`/`rev` in
 > `Cargo.toml` ([cleverfox/embedded-tls](https://github.com/cleverfox/embedded-tls)).
 
+### Web interface authentication
+
+The web page exposes the device's configuration — including the auto-connect URL
+with its embedded auth **token**. To stop anyone on the network from reading it,
+the web interface is protected by **HTTP Basic Auth**.
+
+- **Set a login.** On the page, fill in the **Web login** form (login + password)
+  and save. It takes effect immediately (no reboot); the browser then prompts for
+  credentials on every subsequent visit. To **disable** the login again, submit
+  the form with both fields blank.
+- **Out of the box it is open.** With no credentials set, the interface is
+  unauthenticated — this is required for first-time WiFi setup in AP/config mode.
+  **Set a password as soon as the device is on your network.**
+- **Owner bypass / password reset.** Hold the **GPIO0 (BOOT) button** while
+  loading the page: auth is bypassed for as long as the button is held. This is
+  how the owner — who has physical access — recovers from a forgotten password
+  (open the page with BOOT held, set a new login). Network users without the
+  button and without the password cannot get in.
+
+The password is never stored in clear: only a **salted SHA-256 hash** (per-device
+random salt) is kept in flash, and credentials are checked with a constant-time
+comparison. (A heavier KDF is intentionally not used — the WiFi password already
+lives in this flash in clear, and the GPIO0 bypass means physical access already
+grants full control, so it would only add CPU cost on every status poll. See the
+doc-comment on `AuthConfig` in `src/config.rs`.)
+
 > **Boot note (from the board docs):** holding the GPIO0 KEY while powering on
 > keeps the chip in download/boot mode; power-cycle again to run. Remove any TF
 > card before flashing or flashing fails.
